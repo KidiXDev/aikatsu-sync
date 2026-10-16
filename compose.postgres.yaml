@@ -1,0 +1,33 @@
+# Postgres: put POSTGRES_PASSWORD=<letters and digits, e.g. from `openssl rand -hex 24`> in a .env file here, then
+#   docker compose -f compose.postgres.yaml up -d
+services:
+  sync:
+    image: ghcr.io/kidixdev/aikatsu-sync:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000" # behind a reverse proxy on this machine, use "127.0.0.1:3000:3000"
+    environment:
+      DATABASE_URL: postgres://aikatsu:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/aikatsu
+      ALLOW_REGISTRATION: "true" # "false" once your own account exists, if the server is just for you
+      TRUST_PROXY: "false" # "true" behind a reverse proxy (Caddy, nginx, Traefik)
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aikatsu
+      POSTGRES_DB: aikatsu
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aikatsu -d aikatsu"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

@@ -1,0 +1,16 @@
+# SQLite: everything lives in the `data` volume. For Postgres, use compose.postgres.yaml.
+#   docker compose up -d
+services:
+  sync:
+    image: ghcr.io/kidixdev/aikatsu-sync:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000" # behind a reverse proxy on this machine, use "127.0.0.1:3000:3000"
+    environment:
+      ALLOW_REGISTRATION: "true" # "false" once your own account exists, if the server is just for you
+      TRUST_PROXY: "false" # "true" behind a reverse proxy (Caddy, nginx, Traefik)
+    volumes:
+      - data:/data
+
+volumes:
+  data:
