@@ -13,7 +13,6 @@ if (!user) {
   console.error(`No user named ${name}.`);
   process.exit(1);
 }
-// Signs out every device, so whoever had the old password loses access too.
 await sql`DELETE FROM sessions WHERE user_id = ${user.id}`;
 console.log(`New password for ${name}: ${password}`);
 await sql.close();

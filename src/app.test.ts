@@ -22,7 +22,6 @@ beforeAll(async () => {
 let n = 0;
 const unique = () => `user${++n}${Date.now() % 100000}`;
 
-// Each request from its own address unless `ip` is given; the proxy appends the real one last.
 async function req(path: string, body?: unknown, token?: string, target = app, ip = `198.51.100.${n++ % 250}`) {
   const res = await target.handle(
     new Request(`http://localhost${path}`, {
@@ -75,7 +74,6 @@ test("sign-ups are limited per address, taken from the proxy's entry", async () 
   const signUp = () => req("/auth/register", { username: unique(), password: "hunter2hunter2" }, undefined, fresh, "192.0.2.1");
   for (let i = 0; i < 5; i++) expect((await signUp()).status).toBe(201);
   expect((await signUp()).status).toBe(429);
-  // Same spoofable first entry, different real address: allowed.
   expect((await req("/auth/register", { username: unique(), password: "hunter2hunter2" }, undefined, fresh, "192.0.2.2")).status).toBe(201);
 });
 
@@ -90,7 +88,6 @@ test("last write wins, deletions, and rejected changes come back", async () => {
   expect(r.json.changes.length).toBe(3);
   const cursor = r.json.cursor;
 
-  // Older "a" loses and comes back even though the cursor is past it; newer "b" wins; a duplicate keeps the newest.
   r = await req("/sync", { cursor, changes: [progress("a", 50), progress("b", 200), progress("b", 150)] }, token);
   const byKey = Object.fromEntries(r.json.changes.map((c: { key: string }) => [c.key, c]));
   expect(byKey.a).toEqual({ kind: "progress", key: "a", updatedAt: 100, deleted: false, data: { pos: 100 } });
@@ -100,7 +97,6 @@ test("last write wins, deletions, and rejected changes come back", async () => {
   r = await req("/sync", { cursor: r.json.cursor, changes: [{ kind: "progress", key: "a", updatedAt: 300, deleted: true, data: { ignored: 1 } }] }, token);
   expect(r.json.changes).toEqual([{ kind: "progress", key: "a", updatedAt: 300, deleted: true, data: null }]);
 
-  // A second device starting from 0 gets the latest of everything.
   r = await req("/sync", { cursor: 0, changes: [] }, token);
   expect(r.json.changes.map((c: { key: string; updatedAt: number }) => `${c.key}@${c.updatedAt}`).sort()).toEqual(["a@300", "b@200", "quality@0"]);
   expect(r.json.more).toBe(false);
@@ -141,7 +137,7 @@ test("limits", async () => {
   expect((await req("/sync", { cursor: 0, changes: [progress("1", 1), progress("2", 1), progress("3", 1)] }, c.token, capped)).status).toBe(200);
   const over = await req("/sync", { cursor: 0, changes: [progress("4", 1)] }, c.token, capped);
   expect(over.status).toBe(413);
-  expect((await req("/sync", { cursor: 0, changes: [] }, c.token, capped)).json.changes.length).toBe(3); // rolled back
+  expect((await req("/sync", { cursor: 0, changes: [] }, c.token, capped)).json.changes.length).toBe(3);
 });
 
 test("wrong passwords are rate limited per username", async () => {

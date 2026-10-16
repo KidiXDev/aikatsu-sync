@@ -3,12 +3,10 @@ import type { SQL, Server } from "bun";
 
 export interface Config {
   allowRegistration: boolean;
-  /** Read the client IP from the X-Forwarded-For entry the proxy appended. */
   trustProxy: boolean;
   maxRecordsPerUser: number;
 }
 
-/** Seconds a session may go unused. */
 export const SESSION_IDLE = 180 * 86400;
 const PUSH_LIMIT = 500;
 const PULL_LIMIT = 1000;
@@ -26,7 +24,6 @@ const fail = (status: number, message: string): never => {
   throw new HttpError(status, message);
 };
 
-// ponytail: per-process memory; move counters to the database or Redis to run several replicas.
 function limiter(max: number, windowSeconds: number) {
   const hits = new Map<string, { n: number; reset: number }>();
   const live = (key: string) => {
@@ -35,7 +32,6 @@ function limiter(max: number, windowSeconds: number) {
   };
   return {
     blocked: (key: string) => (live(key)?.n ?? 0) >= max,
-    /** True once over the limit. */
     count(key: string): boolean {
       if (hits.size > 10_000) for (const [k, h] of hits) if (h.reset <= now()) hits.delete(k);
       const h = live(key) ?? { n: 0, reset: now() + windowSeconds };
@@ -89,10 +85,10 @@ const toChange = (r: Row) => ({
 export function createApp(sql: SQL, config: Config) {
   // Unknown usernames still pay for a verify, so timing doesn't reveal which names exist.
   const dummyHash = Bun.password.hash(randomToken(16));
-  const newAccounts = limiter(5, 3600); // per IP, successful sign-ups
-  const nameFailures = limiter(10, 900); // per username, wrong passwords
-  const ipFailures = limiter(50, 900); // per IP, wrong passwords
-  const requests = limiter(120, 60); // per user, signed-in requests
+  const newAccounts = limiter(5, 3600);
+  const nameFailures = limiter(10, 900);
+  const ipFailures = limiter(50, 900);
+  const requests = limiter(120, 60);
 
   const ipOf = (request: Request, server: Server<unknown> | null) => {
     const forwarded = config.trustProxy && request.headers.get("x-forwarded-for");
@@ -157,7 +153,7 @@ export function createApp(sql: SQL, config: Config) {
         if (newAccounts.blocked(ip)) fail(429, "Too many sign-ups. Try again later.");
         const username = checkUsername(body.username);
         checkPassword(body.password);
-        // Checked before hashing so taken names cost nothing; ON CONFLICT covers the race.
+        // Checked before hashing so taken names cost nothing.
         const [taken] = await sql`SELECT 1 FROM users WHERE username = ${username}`;
         if (taken) fail(409, "Username is taken.");
         const id = Bun.randomUUIDv7();
@@ -235,13 +231,11 @@ export function createApp(sql: SQL, config: Config) {
               const rows = changes.map((c) => {
                 const data = JSON.stringify(c.deleted ? null : (c.data ?? null));
                 if (Buffer.byteLength(data) > MAX_DATA_BYTES) fail(413, "A record is too large.");
-                // ponytail: clamps clocks running ahead; a device whose clock is far behind loses every conflict.
                 return { user_id: user.id, kind: c.kind, key: c.key, data, updated_at: Math.min(c.updatedAt, now() + 60), deleted: c.deleted ? 1 : 0, seq: 0 };
               });
               await sql.begin(async (tx) => {
-                // Locks the user row until commit, so one user's writes commit in seq order and a pull never skips one.
+                // Locks the user row until commit, so a pull never skips a seq.
                 const [{ seq }] = await tx`UPDATE users SET seq = seq + ${rows.length} WHERE id = ${user.id} RETURNING seq`;
-                // ponytail: counts updates as new records, so a user at the cap can't sync anything; count new keys only if that bites.
                 const [{ n }] = await tx`SELECT COUNT(*) AS n FROM records WHERE user_id = ${user.id}`;
                 if (Number(n) + rows.length > config.maxRecordsPerUser) fail(413, "Storage limit reached.");
                 rows.forEach((r, i) => (r.seq = Number(seq) - rows.length + i + 1));
@@ -252,7 +246,7 @@ export function createApp(sql: SQL, config: Config) {
                             WHERE excluded.updated_at > records.updated_at
                             RETURNING kind, key`).map(id),
                 );
-                // The stored record beat these; send it back even if the client's cursor is already past it.
+                // Send back what beat these, even if the client's cursor is already past it.
                 const lost = changes.filter((c) => !accepted.has(id(c)));
                 if (lost.length) {
                   const keys = [...new Set(lost.map((c) => c.key))];

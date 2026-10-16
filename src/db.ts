@@ -4,8 +4,7 @@ import { dirname } from "node:path";
 
 export const DEFAULT_DATABASE_URL = "sqlite://data/aikatsu-sync.db";
 
-// Runs on both databases: text ids (no autoincrement) and plain types. `data` is
-// the app's JSON, never read here, so app changes need no server update.
+// `data` is the app's JSON and never read here.
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS users (
     id            TEXT   PRIMARY KEY,
@@ -35,7 +34,6 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS records_seq ON records (user_id, seq)`,
 ];
 
-/** SQLite (`sqlite://path`, `:memory:`) or Postgres (`postgres://…`); every query runs unchanged on both. */
 export async function connect(url: string): Promise<SQL> {
   const postgres = /^postgres(ql)?:\/\//.test(url);
   const sqlite = url.match(/^(?:sqlite:(?:\/\/)?|file:)(.+)$/)?.[1] ?? (url === ":memory:" ? url : undefined);
