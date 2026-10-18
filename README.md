@@ -23,7 +23,7 @@ docker compose -f compose.postgres.yaml up -d
 
 Then, in Aikatsu, go to **Settings → Sync**, choose **Change** next to **Server**, enter `http://<your machine>:3000`, and create your account. The server can only be changed while signed out.
 
-Outside your home network, put the server behind a reverse proxy with HTTPS, so passwords don't travel unencrypted. With [Caddy](https://caddyserver.com), the whole config is:
+Use a reverse proxy with HTTPS, including on a shared home network: sync carries passwords, session tokens, and folder-sharing credentials. Plain HTTP is only suitable for a trusted development setup. With [Caddy](https://caddyserver.com), the whole config is:
 
 ```
 sync.example.com {
@@ -96,10 +96,12 @@ Each call pushes up to 500 local changes, then pulls whatever changed since `cur
 
 | What               | Limit                                     |
 | ------------------ | ----------------------------------------- |
-| Sign-ups           | 5 per hour per IP                         |
+| Sign-up attempts   | 5 per hour per IP                         |
 | Wrong passwords    | 10 per 15 minutes per username, 50 per IP |
 | Signed-in requests | 120 per minute per account                |
 | Request body       | 2 MiB                                     |
+
+Password hashing and verification are limited to four concurrent operations per server process. Excess requests return `429`; retry shortly. Pending password attempts also count toward the failure limits until they succeed, so concurrent requests cannot bypass them. Storage limits count new records; updates and deletions of existing records still work at the limit.
 
 ## Develop
 

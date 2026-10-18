@@ -31,7 +31,6 @@ function limiter(max: number, windowSeconds: number) {
     return h && h.reset > now() ? h : undefined;
   };
   return {
-    blocked: (key: string) => (live(key)?.n ?? 0) >= max,
     count(key: string): boolean {
       if (hits.size > 10_000) for (const [k, h] of hits) if (h.reset <= now()) hits.delete(k);
       const h = live(key) ?? { n: 0, reset: now() + windowSeconds };
@@ -39,7 +38,14 @@ function limiter(max: number, windowSeconds: number) {
       hits.set(key, h);
       return h.n > max;
     },
-    clear: (key: string) => void hits.delete(key),
+    reserve(key: string): (() => void) | undefined {
+      if ((live(key)?.n ?? 0) >= max) return;
+      if (hits.size > 10_000) for (const [k, h] of hits) if (h.reset <= now()) hits.delete(k);
+      const h = live(key) ?? { n: 0, reset: now() + windowSeconds };
+      h.n++;
+      hits.set(key, h);
+      return () => { if (hits.get(key) === h && --h.n === 0) hits.delete(key); };
+    },
   };
 }
 
@@ -89,16 +95,39 @@ export function createApp(sql: SQL, config: Config) {
   const nameFailures = limiter(10, 900);
   const ipFailures = limiter(50, 900);
   const requests = limiter(120, 60);
+  let passwordJobs = 0;
+  async function passwordWork<T>(work: () => Promise<T>): Promise<T> {
+    if (passwordJobs >= 4) fail(429, "Too many sign-in requests. Try again shortly.");
+    passwordJobs++;
+    try { return await work(); }
+    finally { passwordJobs--; }
+  }
+
+  function passwordAttempt(username: string, ip: string) {
+    const releaseName = nameFailures.reserve(username);
+    if (!releaseName) return fail(429, "Too many wrong passwords. Try again in 15 minutes.");
+    const releaseIp = ipFailures.reserve(ip);
+    if (!releaseIp) {
+      releaseName();
+      return fail(429, "Too many wrong passwords. Try again in 15 minutes.");
+    }
+    return () => { releaseName(); releaseIp(); };
+  }
 
   const ipOf = (request: Request, server: Server<unknown> | null) => {
     const forwarded = config.trustProxy && request.headers.get("x-forwarded-for");
     return forwarded ? forwarded.split(",").at(-1)!.trim() : (server?.requestIP(request)?.address ?? "unknown");
   };
 
-  async function createSession(userId: string, device = "") {
+  async function createSession(userId: string, passwordHash: string, device = "") {
     const token = randomToken(32);
-    await sql`INSERT INTO sessions (token_hash, user_id, device, created_at, last_used_at)
-              VALUES (${sha256(token)}, ${userId}, ${device}, ${now()}, ${now()})`;
+    await sql.begin(async (tx) => {
+      // Serialize with password resets and account deletion before issuing a session.
+      const locked = await tx`UPDATE users SET seq = seq WHERE id = ${userId} AND password_hash = ${passwordHash} RETURNING id`;
+      if (!locked.length) fail(401, "Sign-in changed. Try again.");
+      await tx`INSERT INTO sessions (token_hash, user_id, device, created_at, last_used_at)
+                VALUES (${sha256(token)}, ${userId}, ${device}, ${now()}, ${now()})`;
+    });
     return token;
   }
 
@@ -116,10 +145,11 @@ export function createApp(sql: SQL, config: Config) {
   }
 
   async function verify(user: { username: string; passwordHash: string }, password: string, ip: string) {
-    if (nameFailures.blocked(user.username) || ipFailures.blocked(ip)) fail(429, "Too many wrong passwords. Try again in 15 minutes.");
-    if (await Bun.password.verify(password, user.passwordHash)) return;
-    nameFailures.count(user.username);
-    ipFailures.count(ip);
+    const release = passwordAttempt(user.username, ip);
+    let ok: boolean;
+    try { ok = await passwordWork(() => Bun.password.verify(password, user.passwordHash)); }
+    catch (e) { release(); throw e; }
+    if (ok) { release(); return; }
     fail(403, "Wrong password.");
   }
 
@@ -150,20 +180,20 @@ export function createApp(sql: SQL, config: Config) {
       async ({ body, request, server, set }) => {
         if (!config.allowRegistration) fail(403, "Sign-ups are closed.");
         const ip = ipOf(request, server);
-        if (newAccounts.blocked(ip)) fail(429, "Too many sign-ups. Try again later.");
+        if (newAccounts.count(ip)) fail(429, "Too many sign-ups. Try again later.");
         const username = checkUsername(body.username);
         checkPassword(body.password);
         // Checked before hashing so taken names cost nothing.
         const [taken] = await sql`SELECT 1 FROM users WHERE username = ${username}`;
         if (taken) fail(409, "Username is taken.");
         const id = Bun.randomUUIDv7();
+        const passwordHash = await passwordWork(() => Bun.password.hash(body.password));
         const created = await sql`INSERT INTO users (id, username, password_hash, created_at)
-                                  VALUES (${id}, ${username}, ${await Bun.password.hash(body.password)}, ${now()})
+                                  VALUES (${id}, ${username}, ${passwordHash}, ${now()})
                                   ON CONFLICT (username) DO NOTHING RETURNING id`;
         if (!created.length) fail(409, "Username is taken.");
-        newAccounts.count(ip);
         set.status = 201;
-        return { token: await createSession(id, body.device), username };
+        return { token: await createSession(id, passwordHash, body.device), username };
       },
       { body: credentials },
     )
@@ -172,16 +202,19 @@ export function createApp(sql: SQL, config: Config) {
       async ({ body, request, server }) => {
         const username = body.username.trim().toLowerCase();
         const ip = ipOf(request, server);
-        if (nameFailures.blocked(username) || ipFailures.blocked(ip)) fail(429, "Too many failed sign-ins. Try again in 15 minutes.");
-        const [user] = await sql`SELECT id, password_hash FROM users WHERE username = ${username}`;
-        const ok = await Bun.password.verify(body.password, user?.password_hash ?? (await dummyHash));
+        const release = passwordAttempt(username, ip);
+        let user: { id: string; password_hash: string } | undefined;
+        let ok: boolean;
+        try {
+          [user] = await sql`SELECT id, password_hash FROM users WHERE username = ${username}`;
+          const hash = user?.password_hash ?? (await dummyHash);
+          ok = await passwordWork(() => Bun.password.verify(body.password, hash));
+        } catch (e) { release(); throw e; }
         if (!user || !ok) {
-          nameFailures.count(username);
-          ipFailures.count(ip);
-          fail(401, "Wrong username or password.");
+          return fail(401, "Wrong username or password.");
         }
-        nameFailures.clear(username);
-        return { token: await createSession(user.id, body.device), username };
+        release();
+        return { token: await createSession(user.id, user.password_hash, body.device), username };
       },
       { body: credentials },
     )
@@ -197,8 +230,10 @@ export function createApp(sql: SQL, config: Config) {
           async ({ user, body, request, server }) => {
             await verify(user, body.current, ipOf(request, server));
             checkPassword(body.password);
+            const passwordHash = await passwordWork(() => Bun.password.hash(body.password));
             await sql.begin(async (tx) => {
-              await tx`UPDATE users SET password_hash = ${await Bun.password.hash(body.password)} WHERE id = ${user.id}`;
+              const changed = await tx`UPDATE users SET password_hash = ${passwordHash} WHERE id = ${user.id} AND password_hash = ${user.passwordHash} RETURNING id`;
+              if (!changed.length) fail(401, "Account changed. Sign in again.");
               await tx`DELETE FROM sessions WHERE user_id = ${user.id} AND token_hash <> ${user.tokenHash}`;
             });
             return new Response(null, { status: 204 });
@@ -210,6 +245,8 @@ export function createApp(sql: SQL, config: Config) {
           async ({ user, body, request, server }) => {
             await verify(user, body.password, ipOf(request, server));
             await sql.begin(async (tx) => {
+              const locked = await tx`UPDATE users SET seq = seq WHERE id = ${user.id} AND password_hash = ${user.passwordHash} RETURNING id`;
+              if (!locked.length) fail(401, "Account changed. Sign in again.");
               await tx`DELETE FROM records WHERE user_id = ${user.id}`;
               await tx`DELETE FROM sessions WHERE user_id = ${user.id}`;
               await tx`DELETE FROM users WHERE id = ${user.id}`;
@@ -235,9 +272,14 @@ export function createApp(sql: SQL, config: Config) {
               });
               await sql.begin(async (tx) => {
                 // Locks the user row until commit, so a pull never skips a seq.
-                const [{ seq }] = await tx`UPDATE users SET seq = seq + ${rows.length} WHERE id = ${user.id} RETURNING seq`;
+                const [locked] = await tx`UPDATE users SET seq = seq + ${rows.length} WHERE id = ${user.id} RETURNING seq`;
+                if (!locked) fail(401, "Session expired.");
+                const { seq } = locked;
                 const [{ n }] = await tx`SELECT COUNT(*) AS n FROM records WHERE user_id = ${user.id}`;
-                if (Number(n) + rows.length > config.maxRecordsPerUser) fail(413, "Storage limit reached.");
+                const keys = [...new Set(rows.map((r) => r.key))];
+                const existing = new Set((await tx`SELECT kind, key FROM records WHERE user_id = ${user.id} AND key IN ${sql(keys)}`).map(id));
+                const added = rows.filter((r) => !existing.has(id(r))).length;
+                if (Number(n) + added > config.maxRecordsPerUser) fail(413, "Storage limit reached.");
                 rows.forEach((r, i) => (r.seq = Number(seq) - rows.length + i + 1));
                 const accepted = new Set(
                   (await tx`INSERT INTO records ${sql(rows)}

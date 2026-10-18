@@ -1,5 +1,5 @@
 // SQLite in memory by default; set TEST_DATABASE_URL=postgres://… to run the same suite on Postgres.
-import { beforeAll, expect, test } from "bun:test";
+import { beforeAll, expect, spyOn, test } from "bun:test";
 import type { SQL } from "bun";
 import { type Config, createApp } from "./app";
 import { connect } from "./db";
@@ -175,4 +175,52 @@ test("deleting the account removes its data", async () => {
   expect((await req("/auth/login", { username, password: "hunter2hunter2" })).status).toBe(401);
   const [{ n }] = await sql`SELECT COUNT(*) AS n FROM records r WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = r.user_id)`;
   expect(Number(n)).toBe(0);
+});
+
+test("accounts at their record limit can still update and delete existing records", async () => {
+  const capped = createApp(sql, { ...config, maxRecordsPerUser: 1 });
+  const { token } = await account(capped);
+  expect((await req("/sync", { cursor: 0, changes: [progress("only", 1)] }, token, capped)).status).toBe(200);
+  expect((await req("/sync", { cursor: 0, changes: [progress("only", 2)] }, token, capped)).status).toBe(200);
+  expect((await req("/sync", { cursor: 0, changes: [{ ...progress("only", 3), deleted: true }] }, token, capped)).status).toBe(200);
+  expect((await req("/sync", { cursor: 0, changes: [progress("new", 4)] }, token, capped)).status).toBe(413);
+});
+
+test("simultaneous sign-ups cannot bypass the address limit", async () => {
+  const fresh = createApp(sql, config);
+  const results = await Promise.all(Array.from({ length: 8 }, () =>
+    req("/auth/register", { username: unique(), password: "hunter2hunter2" }, undefined, fresh, "192.0.2.80"),
+  ));
+  expect(results.filter((r) => r.status === 201).length).toBeLessThanOrEqual(5);
+  expect(results.some((r) => r.status === 429)).toBe(true);
+});
+
+
+test("parallel password attempts are bounded before verification", async () => {
+  const fresh = createApp(sql, config);
+  const { username } = await account(fresh);
+  const results = await Promise.all(Array.from({ length: 12 }, () =>
+    req("/auth/login", { username, password: "wrong-password" }, undefined, fresh, "192.0.2.90"),
+  ));
+  expect(results.filter((r) => r.status === 401).length).toBeLessThanOrEqual(10);
+  expect(results.some((r) => r.status === 429)).toBe(true);
+  expect(results.every((r) => r.status === 401 || r.status === 429)).toBe(true);
+});
+
+test("a login using an old password cannot issue a session after a reset", async () => {
+  const { username, token } = await account();
+  const passwordHash = await Bun.password.hash("replacement-password");
+  const original = Bun.password.verify;
+  const mock = spyOn(Bun.password, "verify").mockImplementation(async (password, hash, algorithm) => {
+    await sql.begin(async (tx) => {
+      const [user] = await tx`UPDATE users SET password_hash = ${passwordHash} WHERE username = ${username} RETURNING id`;
+      await tx`DELETE FROM sessions WHERE user_id = ${user.id}`;
+    });
+    return original(password, hash, algorithm);
+  });
+  try {
+    expect((await req("/auth/login", { username, password: "hunter2hunter2" })).status).toBe(401);
+  } finally { mock.mockRestore(); }
+  expect((await req("/sync", { cursor: 0, changes: [] }, token)).status).toBe(401);
+  expect((await req("/auth/login", { username, password: "replacement-password" })).status).toBe(200);
 });

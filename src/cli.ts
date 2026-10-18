@@ -7,12 +7,16 @@ if (command !== "reset-password" || !name) {
 }
 const sql = await connect(process.env.DATABASE_URL || DEFAULT_DATABASE_URL);
 const password = Buffer.from(crypto.getRandomValues(new Uint8Array(12))).toString("base64url");
-const [user] = await sql`UPDATE users SET password_hash = ${await Bun.password.hash(password)}
-                         WHERE username = ${name.trim().toLowerCase()} RETURNING id`;
+const hash = await Bun.password.hash(password);
+const user = await sql.begin(async (tx) => {
+  const [user] = await tx`UPDATE users SET password_hash = ${hash}
+                           WHERE username = ${name.trim().toLowerCase()} RETURNING id`;
+  if (user) await tx`DELETE FROM sessions WHERE user_id = ${user.id}`;
+  return user;
+});
 if (!user) {
   console.error(`No user named ${name}.`);
   process.exit(1);
 }
-await sql`DELETE FROM sessions WHERE user_id = ${user.id}`;
 console.log(`New password for ${name}: ${password}`);
 await sql.close();
