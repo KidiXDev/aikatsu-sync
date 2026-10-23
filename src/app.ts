@@ -126,9 +126,14 @@ const PARTY_PAGE = `<!doctype html>
   <p><a href="https://github.com/KidiXDev/aikatsu/releases/latest">Get Aikatsu</a></p>
 </main>
 <script>
-  const m = location.pathname.match(/^(.*)\/party\/([A-Za-z0-9_-]+)\/?$/);
-  if (m) document.getElementById("open").href =
-    "aikatsu://party?server=" + encodeURIComponent(location.origin + m[1]) + "&id=" + m[2];
+  const path = location.pathname;
+  const at = path.lastIndexOf("/party/");
+  const query = "party?server=" + encodeURIComponent(location.origin + path.slice(0, at)) +
+    "&id=" + encodeURIComponent(path.slice(at + 7).split("/")[0]);
+  document.getElementById("open").href = /Android/.test(navigator.userAgent)
+    ? "intent://" + query + "#Intent;scheme=aikatsu;S.browser_fallback_url=" +
+      encodeURIComponent("https://github.com/KidiXDev/aikatsu/releases/latest") + ";end"
+    : "aikatsu://" + query;
 </script>
 </html>
 `;

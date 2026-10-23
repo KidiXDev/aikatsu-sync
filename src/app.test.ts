@@ -295,8 +295,22 @@ test("a host keeps at most three parties going; left ones don't count", async ()
 });
 
 test("party page opens the app", async () => {
-  const res = await app.handle(new Request(`http://localhost/party/${"a".repeat(22)}`));
+  const id = "a".repeat(22);
+  const res = await app.handle(new Request(`http://localhost/party/${id}`));
   expect(res.status).toBe(200);
   expect(res.headers.get("content-type")).toContain("text/html");
-  expect(await res.text()).toContain("aikatsu://party?server=");
+  const script = (await res.text()).match(/<script>([\s\S]*)<\/script>/)![1]!;
+  const open = (userAgent: string) => {
+    const button = { href: "#" };
+    new Function("location", "navigator", "document", script)(
+      { origin: "https://example.com", pathname: `/sync/party/${id}` },
+      { userAgent },
+      { getElementById: () => button },
+    );
+    return button.href;
+  };
+  const query = `party?server=${encodeURIComponent("https://example.com/sync")}&id=${id}`;
+  expect(open("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5)")).toBe(`aikatsu://${query}`);
+  expect(open("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")).toBe(`aikatsu://${query}`);
+  expect(open("Mozilla/5.0 (Linux; Android 15; Pixel 9)")).toStartWith(`intent://${query}#Intent;scheme=aikatsu;S.browser_fallback_url=`);
 });
