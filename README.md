@@ -33,6 +33,8 @@ sync.example.com {
 
 Then set `TRUST_PROXY: "true"`, so rate limits apply per visitor instead of to the proxy.
 
+Watch-together parties are held in memory, so run one server process, and a restart ends them. Their live updates are server-sent events: Caddy passes them through as is; with nginx, turn off `proxy_buffering` for `/party/`.
+
 ## Configuration
 
 | Variable               | Default                                    | What it does                                                                        |
@@ -72,6 +74,10 @@ Routes marked **auth** need `Authorization: Bearer <token>`. They return `401` o
 | `POST /account/password` (auth) | `{ current, password }`           | `204`, other devices are signed out; `403` wrong current password                                  |
 | `POST /account/delete` (auth)   | `{ password }`                    | `204`, the account and all its records are gone                                                    |
 | `POST /sync` (auth)             | `{ cursor, changes: [Change] }`   | `{ cursor, more, changes: [Change] }`                                                              |
+| `POST /party` (auth)            | `Playback`                        | `201 { id }`; `429` the account already has three parties going                                    |
+| `GET /party/:id/events` (auth)  |                                   | Server-sent events, see [Watch together](#watch-together); `404` ended, `429` full                 |
+| `POST /party/:id/state` (auth)  | `Playback`                        | `{ rev }`; `403` never joined, `404` ended                                                         |
+| `GET /party/:id`                |                                   | A page that opens the party in the app                                                             |
 
 - **Usernames** are 3–32 lowercase letters, digits, `.`, `_` or `-`. Logins ignore case.
 - **Passwords** are 8–128 characters.
@@ -91,6 +97,18 @@ Each call pushes up to 500 local changes, then pulls whatever changed since `cur
 - **Losing changes come back.** The response includes the stored record that beat them, even when the cursor has already passed it.
 - **Deletions** are changes with `deleted: true`. They're kept, so other devices hear about them.
 - **Paging:** keep the returned `cursor` for the next call, and call again while `more` is true. Start from `cursor: 0` to get everything.
+
+### Watch together
+
+`Playback` is `{ anime: { name, url, image, source, anilistId }, episode, position, paused, speed }`. `anime` is optional when updating.
+
+Anyone signed in to this server can join a party by its id. Opening `/party/:id/events` joins it and streams:
+
+- **`state`**: the party's `Playback` plus `at` (server time in ms when it was set), `now` (server time in ms when sent), `by` (the username that set it) and `rev`, which goes up with every change. While playing, the position now is `position + (now - at) / 1000 * speed`.
+- **`members`**: `[{ username, device }]`, whenever someone joins or leaves.
+- A `: ping` comment every 15 seconds.
+
+The first two events are the current `state` and `members`. Any member can set the state, and the latest change wins. A party ends 10 minutes after its last member leaves, and after 12 hours at most. It holds up to 16 members.
 
 ### Limits
 
