@@ -224,3 +224,79 @@ test("a login using an old password cannot issue a session after a reset", async
   expect((await req("/sync", { cursor: 0, changes: [] }, token)).status).toBe(401);
   expect((await req("/auth/login", { username, password: "replacement-password" })).status).toBe(200);
 });
+
+const show = { name: "Frieren", url: "https://example.com/frieren", image: "", source: "example", anilistId: 154587 };
+const playing = { anime: show, episode: 3, position: 120, paused: false, speed: 1 };
+
+async function events(id: string, token: string) {
+  const res = await app.handle(new Request(`http://localhost/party/${id}/events?device=linux`, { headers: { authorization: `Bearer ${token}` } }));
+  expect(res.status).toBe(200);
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  return {
+    async next(): Promise<{ event: string; data: any }> {
+      for (;;) {
+        const end = buffer.indexOf("\n\n");
+        if (end >= 0) {
+          const block = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          const event = block.match(/^event: (.*)$/m)?.[1];
+          const data = block.match(/^data: (.*)$/m)?.[1];
+          if (event && data) return { event, data: JSON.parse(data) };
+          continue;
+        }
+        const { value, done } = await reader.read();
+        if (done) throw new Error("stream ended");
+        buffer += decoder.decode(value, { stream: true });
+      }
+    },
+    close: () => reader.cancel(),
+  };
+}
+
+test("watch together", async () => {
+  const [host, guest, stranger] = [await account(), await account(), await account()];
+  const created = await req("/party", playing, host.token);
+  expect(created.status).toBe(201);
+  const { id } = created.json;
+
+  const h = await events(id, host.token);
+  expect(await h.next()).toMatchObject({ event: "state", data: { ...playing, rev: 1, by: host.username } });
+  expect((await h.next()).data).toEqual([{ username: host.username, device: "linux" }]);
+
+  const g = await events(id, guest.token);
+  expect((await g.next()).data.episode).toBe(3);
+  expect((await g.next()).event).toBe("members");
+  expect((await h.next()).data).toHaveLength(2);
+
+  expect((await req(`/party/${id}/state`, { ...playing, position: 300, paused: true }, guest.token)).json).toEqual({ rev: 2 });
+  expect((await h.next()).data).toMatchObject({ anime: show, position: 300, paused: true, by: guest.username, rev: 2 });
+  expect((await g.next()).data.rev).toBe(2);
+
+  await g.close();
+  expect((await h.next()).data).toEqual([{ username: host.username, device: "linux" }]);
+  await h.close();
+
+  expect((await req(`/party/${id}/state`, playing, stranger.token)).status).toBe(403);
+  expect((await req(`/party/${"x".repeat(22)}/events`, undefined, host.token)).status).toBe(404);
+  expect((await req("/party", { ...playing, speed: 9 }, host.token)).status).toBe(422);
+  expect((await req("/party", playing)).status).toBe(401);
+});
+
+test("a host keeps at most three parties going; left ones don't count", async () => {
+  const host = await account();
+  const open = [];
+  for (let i = 0; i < 3; i++) open.push(await events((await req("/party", playing, host.token)).json.id, host.token));
+  expect((await req("/party", playing, host.token)).status).toBe(429);
+  await open[0]!.close();
+  expect((await req("/party", playing, host.token)).status).toBe(201);
+  for (const s of open.slice(1)) await s.close();
+});
+
+test("party page opens the app", async () => {
+  const res = await app.handle(new Request(`http://localhost/party/${"a".repeat(22)}`));
+  expect(res.status).toBe(200);
+  expect(res.headers.get("content-type")).toContain("text/html");
+  expect(await res.text()).toContain("aikatsu://party?server=");
+});

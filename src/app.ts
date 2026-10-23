@@ -11,6 +11,13 @@ export const SESSION_IDLE = 180 * 86400;
 const PUSH_LIMIT = 500;
 const PULL_LIMIT = 1000;
 const MAX_DATA_BYTES = 16 * 1024;
+const PARTY_MEMBERS = 16;
+const PARTIES_PER_USER = 3;
+const PARTIES = 1000;
+const PARTY_EMPTY_TTL = 600;
+const PARTY_MAX_AGE = 12 * 3600;
+// Bun drops connections idle for longer than serve.idleTimeout.
+const HEARTBEAT_MS = 15_000;
 
 export const now = () => Math.floor(Date.now() / 1000);
 
@@ -76,6 +83,55 @@ const change = t.Object({
   deleted: t.Optional(t.Boolean()),
   data: t.Optional(t.Unknown()),
 });
+
+const anime = t.Object({
+  name: t.String({ maxLength: 300 }),
+  url: t.String({ minLength: 1, maxLength: 2048 }),
+  image: t.String({ maxLength: 2048 }),
+  source: t.String({ minLength: 1, maxLength: 64 }),
+  anilistId: t.Integer({ minimum: 0 }),
+});
+const playback = {
+  episode: t.Number({ minimum: 0, maximum: 100_000 }),
+  position: t.Number({ minimum: 0, maximum: 1_000_000 }),
+  paused: t.Boolean(),
+  speed: t.Number({ minimum: 0.25, maximum: 4 }),
+};
+const partyId = t.Object({ id: t.String({ pattern: "^[A-Za-z0-9_-]{22}$" }) });
+
+type Anime = typeof anime.static;
+type Shared = { anime: Anime; episode: number; position: number; paused: boolean; speed: number; at: number; by: string; rev: number };
+type Listener = { username: string; device: string; send: (event: string, data: unknown) => void };
+// Watch together. Parties live in memory: they last hours at most, so one server instance holds them all.
+type Party = { host: string; created: number; emptySince: number; users: Set<string>; listeners: Set<Listener>; state: Shared };
+
+// Opens the app; built from the page's own address, which the server may not know behind a proxy.
+const PARTY_PAGE = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch together · Aikatsu</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; text-align: center;
+         font: 16px system-ui, sans-serif; background: #191113; color: #efdfe1; }
+  .open { display: inline-block; padding: 14px 28px; border-radius: 999px; background: #ffb1c6; color: #5e1131;
+          font-weight: 600; text-decoration: none; }
+  p { color: #d5c2c6; }
+  p a { color: inherit; }
+</style>
+<main>
+  <h1>Watch together</h1>
+  <p><a class="open" id="open" href="#">Open in Aikatsu</a></p>
+  <p>Sign in to this server in Aikatsu first.</p>
+  <p><a href="https://github.com/KidiXDev/aikatsu/releases/latest">Get Aikatsu</a></p>
+</main>
+<script>
+  const m = location.pathname.match(/^(.*)\/party\/([A-Za-z0-9_-]+)\/?$/);
+  if (m) document.getElementById("open").href =
+    "aikatsu://party?server=" + encodeURIComponent(location.origin + m[1]) + "&id=" + m[2];
+</script>
+</html>
+`;
 
 type Row = { kind: string; key: string; data: string; updated_at: number | string; deleted: number; seq: number | string };
 
@@ -153,7 +209,56 @@ export function createApp(sql: SQL, config: Config) {
     fail(403, "Wrong password.");
   }
 
-  return new Elysia({ serve: { maxRequestBodySize: 2 * 1024 * 1024 } })
+  const parties = new Map<string, Party>();
+
+  function sweepParties() {
+    for (const [id, p] of parties)
+      if ((p.emptySince && p.emptySince < now() - PARTY_EMPTY_TTL) || p.created < now() - PARTY_MAX_AGE) parties.delete(id);
+  }
+
+  const party = (id: string) => parties.get(id) ?? fail(404, "This party has ended.");
+
+  function broadcast(p: Party, event: string, data: unknown) {
+    for (const l of p.listeners) l.send(event, data);
+  }
+
+  const members = (p: Party) => [...p.listeners].map(({ username, device }) => ({ username, device }));
+  const shared = (p: Party) => ({ ...p.state, now: Date.now() });
+
+  function listen(p: Party, user: { id: string; username: string }, device: string, signal: AbortSignal) {
+    if (p.listeners.size >= PARTY_MEMBERS) fail(429, "This party is full.");
+    const encoder = new TextEncoder();
+    let listener: Listener | undefined;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const leave = () => {
+      clearInterval(heartbeat);
+      if (!listener || !p.listeners.delete(listener)) return;
+      if (!p.listeners.size) p.emptySince = now();
+      broadcast(p, "members", members(p));
+    };
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const write = (chunk: string) => {
+          try { controller.enqueue(encoder.encode(chunk)); }
+          catch { leave(); }
+        };
+        listener = { username: user.username, device, send: (event, data) => write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`) };
+        p.users.add(user.id);
+        p.listeners.add(listener);
+        p.emptySince = 0;
+        listener.send("state", shared(p));
+        broadcast(p, "members", members(p));
+        heartbeat = setInterval(() => write(": ping\n\n"), HEARTBEAT_MS);
+        signal.addEventListener("abort", leave);
+      },
+      cancel: leave,
+    });
+    return new Response(stream, {
+      headers: { "content-type": "text/event-stream", "cache-control": "no-store", "x-accel-buffering": "no" },
+    });
+  }
+
+  return new Elysia({ serve: { maxRequestBodySize: 2 * 1024 * 1024, idleTimeout: 2 * HEARTBEAT_MS / 1000 } })
     .onError(({ code, error, set }) => {
       if (error instanceof HttpError) {
         set.status = error.status;
@@ -175,6 +280,18 @@ export function createApp(sql: SQL, config: Config) {
       await sql`SELECT 1`;
       return { ok: true };
     })
+    .get(
+      "/party/:id",
+      () =>
+        new Response(PARTY_PAGE, {
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
+          },
+        }),
+      { params: partyId },
+    )
     .post(
       "/auth/register",
       async ({ body, request, server, set }) => {
@@ -309,6 +426,47 @@ export function createApp(sql: SQL, config: Config) {
             };
           },
           { body: t.Object({ cursor: t.Integer({ minimum: 0 }), changes: t.Array(change, { maxItems: PUSH_LIMIT }) }) },
+        )
+        .post(
+          "/party",
+          ({ user, body, set }) => {
+            sweepParties();
+            // Ones the host has left would only block new ones until they expire.
+            for (const [id, p] of parties) if (p.host === user.id && !p.listeners.size) parties.delete(id);
+            if ([...parties.values()].filter((p) => p.host === user.id).length >= PARTIES_PER_USER) fail(429, "Too many parties.");
+            if (parties.size >= PARTIES) fail(503, "The server is busy. Try again later.");
+            const id = randomToken(16);
+            parties.set(id, {
+              host: user.id,
+              created: now(),
+              emptySince: now(),
+              users: new Set([user.id]),
+              listeners: new Set(),
+              state: { ...body, at: Date.now(), by: user.username, rev: 1 },
+            });
+            set.status = 201;
+            return { id };
+          },
+          { body: t.Object({ anime, ...playback }) },
+        )
+        .get(
+          "/party/:id/events",
+          ({ user, params, query, request }) => {
+            sweepParties();
+            return listen(party(params.id), user, query.device ?? "", request.signal);
+          },
+          { params: partyId, query: t.Object({ device: t.Optional(t.String({ maxLength: 64 })) }) },
+        )
+        .post(
+          "/party/:id/state",
+          ({ user, params, body }) => {
+            const p = party(params.id);
+            if (!p.users.has(user.id)) fail(403, "Join the party first.");
+            p.state = { ...p.state, ...body, at: Date.now(), by: user.username, rev: p.state.rev + 1 };
+            broadcast(p, "state", shared(p));
+            return { rev: p.state.rev };
+          },
+          { params: partyId, body: t.Object({ anime: t.Optional(anime), ...playback }) },
         ),
     );
 }
