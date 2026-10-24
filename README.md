@@ -77,7 +77,7 @@ Routes marked **auth** need `Authorization: Bearer <token>`. They return `401` o
 | `POST /party` (auth)            | `Playback`                        | `201 { id }`; `429` the account already has three parties going                                    |
 | `GET /party/:id/events` (auth)  |                                   | Server-sent events, see [Watch together](#watch-together); `404` ended, `429` full                 |
 | `POST /party/:id/state` (auth)  | `Playback`                        | `{ rev }`; `403` never joined, `404` ended                                                         |
-| `GET /party/:id`                |                                   | A page that opens the party in the app                                                             |
+| `GET /party/:id`                |                                   | A page showing what's playing and how many are in, with a button that opens the app; `404` ended |
 
 - **Usernames** are 3–32 lowercase letters, digits, `.`, `_` or `-`. Logins ignore case.
 - **Passwords** are 8–128 characters.

@@ -294,12 +294,30 @@ test("a host keeps at most three parties going; left ones don't count", async ()
   for (const s of open.slice(1)) await s.close();
 });
 
-test("party page opens the app", async () => {
-  const id = "a".repeat(22);
-  const res = await app.handle(new Request(`http://localhost/party/${id}`));
-  expect(res.status).toBe(200);
-  expect(res.headers.get("content-type")).toContain("text/html");
-  const script = (await res.text()).match(/<script>([\s\S]*)<\/script>/)![1]!;
+test("party page shows who's watching and opens the app", async () => {
+  const host = await account();
+  const { id } = (await req("/party", { ...playing, anime: { ...show, name: "<b>Frieren</b>" } }, host.token)).json;
+  const page = async () => {
+    const res = await app.handle(new Request(`http://localhost/party/${id}`));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    return res.text();
+  };
+  const waiting = await page();
+  expect(waiting).toContain("<h1>&#60;b&#62;Frieren&#60;/b&#62;</h1>");
+  expect(waiting).toContain("No one here yet");
+  expect(waiting).toContain(`Hosted by <strong>${host.username}</strong>`);
+  const h = await events(id, host.token);
+  expect(await page()).toContain("1 watching</strong> · 15 seats left");
+  const rest = await Promise.all(Array.from({ length: 15 }, () => events(id, host.token)));
+  expect(await page()).toContain(`<button class="open" id="open" disabled>Party full</button>`);
+  for (const s of [h, ...rest]) await s.close();
+
+  const ended = await app.handle(new Request(`http://localhost/party/${"a".repeat(22)}`));
+  expect(ended.status).toBe(404);
+  expect(await ended.text()).toContain("This party has ended");
+
+  const script = waiting.match(/<script>([\s\S]*)<\/script>/)![1]!;
   const open = (userAgent: string) => {
     const button = { href: "#" };
     new Function("location", "navigator", "document", script)(

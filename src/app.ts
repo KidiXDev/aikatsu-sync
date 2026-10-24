@@ -103,40 +103,145 @@ type Anime = typeof anime.static;
 type Shared = { anime: Anime; episode: number; position: number; paused: boolean; speed: number; at: number; by: string; rev: number };
 type Listener = { username: string; device: string; send: (event: string, data: unknown) => void };
 // Watch together. Parties live in memory: they last hours at most, so one server instance holds them all.
-type Party = { host: string; created: number; emptySince: number; users: Set<string>; listeners: Set<Listener>; state: Shared };
+type Party = { host: string; hostName: string; created: number; emptySince: number; users: Set<string>; listeners: Set<Listener>; state: Shared };
+
+const RELEASES = "https://github.com/KidiXDev/aikatsu/releases/latest";
+
+const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+function clock(seconds: number) {
+  const s = Math.floor(seconds);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const [h, m] = [Math.floor(s / 3600), Math.floor(s / 60) % 60];
+  return h ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
+}
+
+const icon = (body: string) =>
+  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+const ICON_PEOPLE = icon(`<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>`);
+const ICON_TV = icon(`<rect x="2" y="7" width="20" height="15" rx="3"/><path d="m17 2-5 5-5-5"/>`);
+const ICON_MOON = icon(`<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>`);
+
+const PARTY_STYLE = `
+  :root { color-scheme: dark; --bg: #130d0e; --card: #211719; --high: #2f2226; --text: #f6e0e4; --muted: #baa6aa; --line: #534448;
+          --primary: #ff89b0; --on-primary: #610030; --wash: #7d2160; --on-wash: #ffbde0; --error: #ff6e84; --shadow: rgb(0 0 0 / .6); }
+  @media (prefers-color-scheme: light) {
+    :root { color-scheme: light; --bg: #fff8f8; --card: #fff0f2; --high: #f7e3e7; --text: #3c2f32; --muted: #6b5b5f; --line: #c1adb1;
+            --primary: #ad1c5e; --on-primary: #ffeff1; --wash: #ffbfe1; --on-wash: #7d2160; --error: #b41340; --shadow: rgb(60 20 30 / .18); }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: 24px 16px; text-align: center;
+         font: 16px/1.5 "Google Sans Flex", "Google Sans", system-ui, sans-serif; color: var(--text);
+         background: radial-gradient(110% 55% at 50% 0%, color-mix(in srgb, var(--primary) 14%, transparent), transparent 70%) var(--bg); }
+  main { width: 100%; max-width: 400px; padding: 28px 24px 20px; border-radius: 28px; background: var(--card);
+         box-shadow: 0 24px 64px -24px var(--shadow); animation: rise .35s cubic-bezier(.33, 1, .68, 1); }
+  @keyframes rise { from { opacity: 0; transform: translateY(12px); } }
+  p { margin: 0; }
+  svg { width: 20px; height: 20px; flex: none; }
+  .eyebrow { margin-bottom: 20px; font-size: 13px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .poster { position: relative; display: grid; place-items: center; width: 148px; aspect-ratio: 2 / 3; margin: 0 auto 20px;
+            border-radius: 18px; overflow: hidden; background: var(--high); color: var(--muted); box-shadow: 0 16px 36px -14px var(--shadow); }
+  .poster svg { width: 40px; height: 40px; }
+  .poster img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .status { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 10px; padding: 3px 10px; border-radius: 999px;
+            font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; background: var(--high); color: var(--muted); }
+  .status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .status.live { background: var(--wash); color: var(--on-wash); }
+  .status.live::before { background: var(--primary); animation: pulse 1.6s ease-out infinite; }
+  .status.full { color: var(--error); }
+  @keyframes pulse { from { box-shadow: 0 0 0 0 var(--primary); } to { box-shadow: 0 0 0 6px transparent; } }
+  h1 { margin: 0; font-size: 24px; line-height: 1.25; font-weight: 600; overflow-wrap: anywhere;
+       display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .meta { margin-top: 6px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .room { margin-top: 24px; padding: 16px; border-radius: 20px; background: var(--high); }
+  .who { display: flex; justify-content: center; align-items: center; gap: 8px; color: var(--muted); }
+  .who strong { color: var(--text); font-weight: 600; }
+  .seats { display: flex; justify-content: center; gap: 6px; margin-top: 12px; }
+  .seats i { flex: 0 1 10px; aspect-ratio: 1; border-radius: 50%; background: var(--line); }
+  .seats i.on { background: var(--primary); }
+  .host { margin-top: 12px; font-size: 14px; color: var(--muted); }
+  .host strong { color: var(--text); font-weight: 500; }
+  .note { margin-top: 12px; font-size: 14px; color: var(--muted); }
+  .open { display: block; width: 100%; margin-top: 24px; padding: 14px 24px; border: 0; border-radius: 999px; background: var(--primary);
+          color: var(--on-primary); font: inherit; font-weight: 600; text-decoration: none; cursor: pointer;
+          transition: filter .2s, transform .14s cubic-bezier(.33, 1, .68, 1); }
+  .open:not(:disabled):hover { filter: brightness(1.08); }
+  .open:not(:disabled):active { transform: scale(.97); }
+  .open:disabled { background: var(--high); color: var(--muted); cursor: not-allowed; }
+  a:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+  .hint { margin-top: 12px; font-size: 14px; color: var(--muted); }
+  .gone { display: grid; place-items: center; width: 72px; height: 72px; margin: 4px auto 20px; border-radius: 50%; background: var(--high); color: var(--primary); }
+  .gone svg { width: 32px; height: 32px; }
+  .lead { margin-top: 8px; color: var(--muted); }
+  footer { margin-top: 20px; padding-top: 16px; border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); font-size: 14px; color: var(--muted); }
+  footer a { color: var(--primary); font-weight: 500; text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  @media (prefers-reduced-motion: reduce) { *, ::before { animation: none !important; transition: none !important; } }
+`;
 
 // Opens the app; built from the page's own address, which the server may not know behind a proxy.
-const PARTY_PAGE = `<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Watch together · Aikatsu</title>
-<style>
-  body { margin: 0; min-height: 100vh; display: grid; place-items: center; text-align: center;
-         font: 16px system-ui, sans-serif; background: #191113; color: #efdfe1; }
-  .open { display: inline-block; padding: 14px 28px; border-radius: 999px; background: #ffb1c6; color: #5e1131;
-          font-weight: 600; text-decoration: none; }
-  p { color: #d5c2c6; }
-  p a { color: inherit; }
-</style>
-<main>
-  <h1>Watch together</h1>
-  <p><a class="open" id="open" href="#">Open in Aikatsu</a></p>
-  <p>Sign in to this server in Aikatsu first.</p>
-  <p><a href="https://github.com/KidiXDev/aikatsu/releases/latest">Get Aikatsu</a></p>
-</main>
-<script>
+const OPEN_SCRIPT = `<script>
   const path = location.pathname;
   const at = path.lastIndexOf("/party/");
   const query = "party?server=" + encodeURIComponent(location.origin + path.slice(0, at)) +
     "&id=" + encodeURIComponent(path.slice(at + 7).split("/")[0]);
   document.getElementById("open").href = /Android/.test(navigator.userAgent)
-    ? "intent://" + query + "#Intent;scheme=aikatsu;S.browser_fallback_url=" +
-      encodeURIComponent("https://github.com/KidiXDev/aikatsu/releases/latest") + ";end"
+    ? "intent://" + query + "#Intent;scheme=aikatsu;S.browser_fallback_url=" + encodeURIComponent("${RELEASES}") + ";end"
     : "aikatsu://" + query;
-</script>
+</script>`;
+
+const partyHtml = (title: string, body: string) => `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)} · Aikatsu</title>
+<style>${PARTY_STYLE}</style>
+<main>
+  <p class="eyebrow">Aikatsu · Watch together</p>
+  ${body}
+  <footer><a href="${RELEASES}">Get Aikatsu</a></footer>
+</main>
 </html>
 `;
+
+const ENDED_PAGE = partyHtml(
+  "Party ended",
+  `<div class="gone">${ICON_MOON}</div>
+  <h1>This party has ended</h1>
+  <p class="lead">Ask the host for a new link.</p>`,
+);
+
+function partyPage(p: Party) {
+  const { anime, episode, paused, position, speed, at } = p.state;
+  const watching = p.listeners.size;
+  const full = watching >= PARTY_MEMBERS;
+  const playing = watching > 0 && !paused;
+  const livePosition = playing ? position + ((Date.now() - at) / 1000) * speed : position;
+  const left = Math.min(p.created + PARTY_MAX_AGE, p.emptySince ? p.emptySince + PARTY_EMPTY_TTL : Infinity) - now();
+  const [status, label] = full ? ["full", "Full"] : watching ? ["live", "Live"] : ["waiting", "Waiting"];
+  const seatsLeft = PARTY_MEMBERS - watching;
+  const name = anime.name || "Untitled";
+  const poster = /^https:\/\//.test(anime.image) ? `<img src="${escapeHtml(anime.image)}" alt="" referrerpolicy="no-referrer">` : "";
+  return partyHtml(
+    `Watch ${name} together`,
+    `<div class="poster">${ICON_TV}${poster}</div>
+  <span class="status ${status}">${label}</span>
+  <h1>${escapeHtml(name)}</h1>
+  <p class="meta">Episode ${episode} · ${clock(livePosition)} · ${playing ? "Playing" : "Paused"}</p>
+  <div class="room">
+    <p class="who">${ICON_PEOPLE}${watching
+      ? `<span><strong>${watching} watching</strong>${full ? "" : ` · ${seatsLeft} ${seatsLeft === 1 ? "seat" : "seats"} left`}</span>`
+      : `<span>No one here yet</span>`}</p>
+    <div class="seats" role="img" aria-label="${watching} of ${PARTY_MEMBERS} seats taken">${
+      Array.from({ length: PARTY_MEMBERS }, (_, i) => (i < watching ? `<i class="on"></i>` : "<i></i>")).join("")}</div>
+    <p class="host">Hosted by <strong>${escapeHtml(p.hostName)}</strong></p>
+  </div>
+  ${left < 3600 ? `<p class="note">Closes in ${Math.max(1, Math.ceil(left / 60))} min</p>` : ""}
+  ${full ? `<button class="open" id="open" disabled>Party full</button>` : `<a class="open" id="open" href="#">Join in Aikatsu</a>`}
+  <p class="hint">Sign in to Aikatsu first.</p>
+  ${OPEN_SCRIPT}`,
+  );
+}
 
 type Row = { kind: string; key: string; data: string; updated_at: number | string; deleted: number; seq: number | string };
 
@@ -287,14 +392,18 @@ export function createApp(sql: SQL, config: Config) {
     })
     .get(
       "/party/:id",
-      () =>
-        new Response(PARTY_PAGE, {
+      ({ params }) => {
+        sweepParties();
+        const p = parties.get(params.id);
+        return new Response(p ? partyPage(p) : ENDED_PAGE, {
+          status: p ? 200 : 404,
           headers: {
             "content-type": "text/html; charset=utf-8",
             "cache-control": "no-store",
-            "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
+            "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src https:",
           },
-        }),
+        });
+      },
       { params: partyId },
     )
     .post(
@@ -443,6 +552,7 @@ export function createApp(sql: SQL, config: Config) {
             const id = randomToken(16);
             parties.set(id, {
               host: user.id,
+              hostName: user.username,
               created: now(),
               emptySince: now(),
               users: new Set([user.id]),
